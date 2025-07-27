@@ -68,6 +68,10 @@ class PersistenceManager:
         self.auto_save_interval = 30
         self.last_save_time = time.time()
         
+        # 备份间隔（24小时）
+        self.backup_interval = 86400  # 24小时
+        self.last_backup_time = time.time()
+        
         # 数据变更检测
         self.last_forwards_hash = None
         self.last_stats_hash = None
@@ -135,10 +139,15 @@ class PersistenceManager:
                     'error': forward_info.get('error')
                 }
             
-            # 创建备份
-            if self.forwards_file.exists():
-                backup_file = self.backup_dir / f"forwards_backup_{int(time.time())}.json"
+            # 检查是否需要创建备份（24小时一次）
+            current_time = time.time()
+            if current_time - self.last_backup_time >= self.backup_interval and self.forwards_file.exists():
+                backup_file = self.backup_dir / f"forwards_backup_{int(current_time)}.json"
                 self.forwards_file.rename(backup_file)
+                self.last_backup_time = current_time
+                logger.info(f"创建转发配置备份: {backup_file}")
+                # 清理旧备份
+                self.cleanup_old_backups()
             
             # 保存新数据
             with open(self.forwards_file, 'w', encoding='utf-8') as f:
@@ -180,10 +189,15 @@ class PersistenceManager:
                 logger.debug("统计信息无变更，跳过保存")
                 return True
             
-            # 创建备份
-            if self.stats_file.exists():
-                backup_file = self.backup_dir / f"stats_backup_{int(time.time())}.json"
+            # 检查是否需要创建备份（24小时一次）
+            current_time = time.time()
+            if current_time - self.last_backup_time >= self.backup_interval and self.stats_file.exists():
+                backup_file = self.backup_dir / f"stats_backup_{int(current_time)}.json"
                 self.stats_file.rename(backup_file)
+                self.last_backup_time = current_time
+                logger.info(f"创建统计信息备份: {backup_file}")
+                # 清理旧备份
+                self.cleanup_old_backups()
             
             # 保存新数据
             with open(self.stats_file, 'w', encoding='utf-8') as f:
@@ -255,10 +269,15 @@ class PersistenceManager:
                 'save_time': time.time()
             }
             
-            # 创建备份
-            if self.security_file.exists():
-                backup_file = self.backup_dir / f"security_backup_{int(time.time())}.pkl"
+            # 检查是否需要创建备份（24小时一次）
+            current_time = time.time()
+            if current_time - self.last_backup_time >= self.backup_interval and self.security_file.exists():
+                backup_file = self.backup_dir / f"security_backup_{int(current_time)}.pkl"
                 self.security_file.rename(backup_file)
+                self.last_backup_time = current_time
+                logger.info(f"创建安全数据备份: {backup_file}")
+                # 清理旧备份
+                self.cleanup_old_backups()
             
             # 保存新数据
             with open(self.security_file, 'wb') as f:
@@ -1796,12 +1815,13 @@ def index():
         return render_template_string(HTML_TEMPLATE, 
                                     security_path=SECURITY_PATH,
                                     error=request.args.get('error'))
-        # 获取公网IP
-        public_ip = get_public_ip()
-        
-        return render_template_string(HTML_TEMPLATE, 
-                                   security_path=SECURITY_PATH,
-                                   public_ip=public_ip)
+    
+    # 获取公网IP
+    public_ip = get_public_ip()
+    
+    return render_template_string(HTML_TEMPLATE, 
+                               security_path=SECURITY_PATH,
+                               public_ip=public_ip)
 
 @app.route(ADMIN_PATH, methods=['POST'])
 def login():
