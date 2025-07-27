@@ -171,7 +171,7 @@ view_login_info() {
     echo -e "${CYAN}--- 访问地址 ---${NC}"
     echo -e "${YELLOW}本机访问:${NC} http://127.0.0.1:5000${path}/admin"
     if [ -n "$public_ip" ]; then
-        echo -e "${YELLOW}公网访问:${NC} http://${public_ip}:5000${path}/admin"
+        echo -e "${YELLOW}公网访问:${NC} http://${public_ip}:5000/${path}/admin"
     else
         echo -e "${RED}公网IP获取失败 (请检查网络或 'curl ifconfig.me')${NC}"
     fi
