@@ -1399,7 +1399,7 @@ IP|远程端口|本地端口 (自动TCP+UDP)
                     if (data.success) {
                         const changesText = document.getElementById('persistenceStatusText');
                         if (data.has_changes) {
-                            changesText.innerHTML = '<span style="color: #ffc107;">⚠️ 有未保存的变更</span>';
+                            changesText.innerHTML = '<span style="color: #ffc107;"></span>';
                         } else {
                             changesText.innerHTML = '<span style="color: #28a745;">✓ 数据已同步</span>';
                         }
