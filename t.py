@@ -328,19 +328,17 @@ class PersistenceManager:
             else:
                 logger.debug("自动保存完成 - 无数据变更")
     
-    def cleanup_old_backups(self, max_backups: int = 10):
-        """清理旧的备份文件"""
+    def cleanup_old_backups(self, max_backups: int = 3):
+        """清理旧的备份文件，最多保留3份"""
         try:
             for backup_type in ['forwards_backup', 'stats_backup', 'security_backup']:
                 backup_files = list(self.backup_dir.glob(f"{backup_type}_*.json")) + \
                              list(self.backup_dir.glob(f"{backup_type}_*.pkl"))
                 backup_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-                
                 # 删除多余的备份文件
-                for backup_file in backup_files[max_backups:]:
+                for backup_file in backup_files[3:]:
                     backup_file.unlink()
                     logger.debug(f"删除旧备份: {backup_file}")
-                    
         except Exception as e:
             logger.error(f"清理备份文件失败: {e}")
 
@@ -449,6 +447,9 @@ class PortForwarder:
         self.stats = persistence_manager.load_stats()
         self.running = True
         
+        # 重启时自动恢复转发的运行状态
+        self.restore_forwards()
+        
         logger.info(f"端口转发器初始化完成，加载了 {len(self.active_forwards)} 个转发配置")
     
     def save_data(self):
@@ -456,12 +457,79 @@ class PortForwarder:
         persistence_manager.save_forwards(self.active_forwards)
         persistence_manager.save_stats(self.stats)
     
+    def restore_forwards(self):
+        """重启时恢复转发状态"""
+        restored_count = 0
+        for forward_id, forward_info in list(self.active_forwards.items()):
+            try:
+                # 检查端口是否可用
+                if not self.check_port_availability(forward_info['local_port']):
+                    logger.warning(f"端口 {forward_info['local_port']} 不可用，跳过恢复转发 {forward_id}")
+                    forward_info['status'] = 'error'
+                    forward_info['error'] = f"端口 {forward_info['local_port']} 被占用"
+                    continue
+                
+                # 重新启动转发
+                protocol = forward_info['protocol'].lower()
+                local_port = forward_info['local_port']
+                remote_host = forward_info['remote_host']
+                remote_port = forward_info['remote_port']
+                
+                logger.info(f"正在恢复转发: {protocol} {local_port} -> {remote_host}:{remote_port}")
+                
+                if protocol == 'tcp':
+                    # TCP异步转发
+                    loop = asyncio.new_event_loop()
+                    def run_tcp():
+                        try:
+                            asyncio.set_event_loop(loop)
+                            loop.run_until_complete(
+                                self.tcp_forward(local_port, remote_host, remote_port, forward_id)
+                            )
+                        except Exception as e:
+                            logger.error(f"TCP forward thread error: {e}")
+                            forward_info['status'] = 'error'
+                            forward_info['error'] = str(e)
+                    
+                    thread = threading.Thread(target=run_tcp, daemon=True)
+                    thread.start()
+                    forward_info['thread'] = thread
+                    
+                elif protocol == 'udp':
+                    # UDP转发
+                    thread = self.udp_forward(local_port, remote_host, remote_port, forward_id)
+                    forward_info['thread'] = thread
+                
+                forward_info['status'] = 'running'
+                forward_info['error'] = None
+                restored_count += 1
+                
+            except Exception as e:
+                logger.error(f"恢复转发失败 {forward_id}: {e}")
+                forward_info['status'] = 'error'
+                forward_info['error'] = str(e)
+        
+        if restored_count > 0:
+            logger.info(f"成功恢复 {restored_count} 个转发")
+            self.save_data()
+    
+    def check_port_availability(self, port):
+        """检查端口是否可用"""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            result = sock.connect_ex(('127.0.0.1', port))
+            sock.close()
+            return result != 0  # 如果连接失败，说明端口可用
+        except Exception:
+            return False
+    
     async def tcp_forward(self, local_port: int, remote_host: str, remote_port: int, forward_id: str):
         """TCP端口转发"""
         try:
             server = await asyncio.start_server(
                 lambda r, w: self.handle_tcp_client(r, w, remote_host, remote_port, forward_id),
-                'localhost', local_port
+                '0.0.0.0', local_port
             )
             
             self.active_forwards[forward_id]['server'] = server
@@ -520,7 +588,7 @@ class PortForwarder:
         def udp_server():
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(('localhost', local_port))
+            sock.bind(('0.0.0.0', local_port))
             
             self.active_forwards[forward_id]['socket'] = sock
             logger.info(f"UDP forwarding started: {local_port} -> {remote_host}:{remote_port}")
@@ -572,14 +640,21 @@ class PortForwarder:
         self.active_forwards[forward_id] = forward_info
         
         try:
+            logger.info(f"Starting {protocol} forward: {local_port} -> {remote_host}:{remote_port}")
+            
             if protocol.lower() == 'tcp':
                 # TCP异步转发
                 loop = asyncio.new_event_loop()
                 def run_tcp():
-                    asyncio.set_event_loop(loop)
-                    loop.run_until_complete(
-                        self.tcp_forward(local_port, remote_host, remote_port, forward_id)
-                    )
+                    try:
+                        asyncio.set_event_loop(loop)
+                        loop.run_until_complete(
+                            self.tcp_forward(local_port, remote_host, remote_port, forward_id)
+                        )
+                    except Exception as e:
+                        logger.error(f"TCP forward thread error: {e}")
+                        forward_info['status'] = 'error'
+                        forward_info['error'] = str(e)
                 
                 thread = threading.Thread(target=run_tcp, daemon=True)
                 thread.start()
@@ -590,8 +665,11 @@ class PortForwarder:
                 thread = self.udp_forward(local_port, remote_host, remote_port, forward_id)
                 forward_info['thread'] = thread
             
+            # 等待一小段时间确保服务启动
+            time.sleep(0.1)
+            
             forward_info['status'] = 'running'
-            logger.info(f"Forward started: {forward_id}")
+            logger.info(f"Forward started successfully: {forward_id}")
             
             # 保存数据到持久化存储
             self.save_data()
@@ -602,6 +680,7 @@ class PortForwarder:
             forward_info['status'] = 'error'
             forward_info['error'] = str(e)
             logger.error(f"Failed to start forward: {e}")
+            logger.error(f"Forward details: protocol={protocol}, local_port={local_port}, remote_host={remote_host}, remote_port={remote_port}")
             
             # 即使失败也保存数据
             self.save_data()
@@ -1149,7 +1228,7 @@ IP|远程端口|本地端口 (自动TCP+UDP)
         </div>
 
         <div class="footer">
-            <p>(c) 2025 专业端口转发工具 -Joey</p>
+            <p>(c) 2025 专业端口转发工具 - Joey</p>
         </div>
     </div>
 
@@ -1717,7 +1796,12 @@ def index():
         return render_template_string(HTML_TEMPLATE, 
                                     security_path=SECURITY_PATH,
                                     error=request.args.get('error'))
-    return render_template_string(HTML_TEMPLATE, security_path=SECURITY_PATH)
+        # 获取公网IP
+        public_ip = get_public_ip()
+        
+        return render_template_string(HTML_TEMPLATE, 
+                                   security_path=SECURITY_PATH,
+                                   public_ip=public_ip)
 
 @app.route(ADMIN_PATH, methods=['POST'])
 def login():
@@ -1788,7 +1872,26 @@ def api_add_forward():
             if forward['local_port'] == local_port and forward['protocol'] == protocol.upper():
                 return jsonify({'success': False, 'error': f'本地端口 {local_port} 已被占用'})
         
+        # 检查端口是否被系统占用
+        try:
+            import socket
+            test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test_socket.settimeout(1)
+            result = test_socket.connect_ex(('127.0.0.1', local_port))
+            test_socket.close()
+            if result == 0:
+                return jsonify({'success': False, 'error': f'本地端口 {local_port} 已被系统占用'})
+        except Exception as e:
+            logger.warning(f"Port availability check failed: {e}")
+        
         forward_id = forwarder.start_forward(protocol, local_port, remote_host, remote_port)
+        
+        # 检查启动结果
+        if forward_id in forwarder.active_forwards:
+            forward_info = forwarder.active_forwards[forward_id]
+            if forward_info['status'] == 'error':
+                return jsonify({'success': False, 'error': forward_info.get('error', '启动失败')})
+        
         return jsonify({'success': True, 'forward_id': forward_id})
         
     except Exception as e:
@@ -2123,6 +2226,19 @@ def auto_save_thread():
         except Exception as e:
             logger.error(f"自动保存线程错误: {e}")
 
+def get_public_ip():
+    """获取公网IP地址"""
+    try:
+        import urllib.request
+        with urllib.request.urlopen('http://ip.42.pl/raw', timeout=5) as response:
+            return response.read().decode('utf-8').strip()
+    except:
+        try:
+            with urllib.request.urlopen('http://ifconfig.me', timeout=5) as response:
+                return response.read().decode('utf-8').strip()
+        except:
+            return None
+
 def main():
     """主函数"""
     # 注册信号处理器
@@ -2132,6 +2248,9 @@ def main():
     print("=" * 60)
     print("专业端口转发工具启动中...")
     print("=" * 60)
+    
+    # 获取公网IP
+    public_ip = get_public_ip()
     
     # 显示配置信息
     if config_manager.config_file.exists():
@@ -2154,7 +2273,14 @@ def main():
         print(f"密码: 随机生成")
         print(f"安全路径: /{SECURITY_PATH}")
     
-    print(f"管理界面: http://localhost:5000{ADMIN_PATH}")
+    # 显示访问地址
+    if public_ip:
+        print(f"管理界面: http://{public_ip}:5000{ADMIN_PATH}")
+        print(f"本地访问: http://localhost:5000{ADMIN_PATH}")
+    else:
+        print(f"管理界面: http://localhost:5000{ADMIN_PATH}")
+        print(f"公网访问: 请手动替换IP地址")
+    
     print(f"访问路径: /{SECURITY_PATH}/admin")
     print(f"日志文件: port_forwarder.log")
     print("=" * 60)
