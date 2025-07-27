@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 专业网络端口转发工具
-支持TCP/UDP转发，Web管理界面，身份验证，商用级稳定性
+支持TCP/UDP转发，Web管理界面，身份验证
 作者: Joey
 许可: MIT License (可商用)
 """
@@ -237,6 +237,11 @@ class PersistenceManager:
             for key, default_value in default_stats.items():
                 if key not in stats:
                     stats[key] = default_value
+            
+            # 确保统计数据不为负数
+            stats['active_connections'] = max(0, stats['active_connections'])
+            stats['total_connections'] = max(0, stats['total_connections'])
+            stats['bytes_transferred'] = max(0, stats['bytes_transferred'])
             
             # 初始化哈希值
             self.last_stats_hash = self._calculate_hash(stats)
@@ -516,8 +521,14 @@ class PortForwarder:
                     
                 elif protocol == 'udp':
                     # UDP转发
-                    thread = self.udp_forward(local_port, remote_host, remote_port, forward_id)
-                    forward_info['thread'] = thread
+                    try:
+                        thread = self.udp_forward(local_port, remote_host, remote_port, forward_id)
+                        forward_info['thread'] = thread
+                    except Exception as e:
+                        logger.error(f"UDP forward restore error: {e}")
+                        forward_info['status'] = 'error'
+                        forward_info['error'] = str(e)
+                        continue
                 
                 forward_info['status'] = 'running'
                 forward_info['error'] = None
@@ -535,11 +546,24 @@ class PortForwarder:
     def check_port_availability(self, port):
         """检查端口是否可用"""
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            result = sock.connect_ex(('127.0.0.1', port))
-            sock.close()
-            return result != 0  # 如果连接失败，说明端口可用
+            # 检查TCP端口
+            tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            tcp_sock.settimeout(1)
+            tcp_result = tcp_sock.connect_ex(('127.0.0.1', port))
+            tcp_sock.close()
+            
+            # 检查UDP端口
+            udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_sock.settimeout(1)
+            try:
+                udp_sock.bind(('127.0.0.1', port))
+                udp_sock.close()
+                udp_available = True
+            except OSError:
+                udp_available = False
+            
+            # 如果TCP或UDP任一可用，则认为端口可用
+            return tcp_result != 0 or udp_available
         except Exception:
             return False
     
@@ -568,12 +592,15 @@ class PortForwarder:
         client_addr = writer.get_extra_info('peername')
         logger.info(f"New TCP connection from {client_addr}")
         
+        connection_counted = False
+        
         try:
             # 连接到远程服务器
             remote_reader, remote_writer = await asyncio.open_connection(remote_host, remote_port)
             
             self.stats['total_connections'] += 1
             self.stats['active_connections'] += 1
+            connection_counted = True
             
             # 双向数据转发
             await asyncio.gather(
@@ -585,7 +612,8 @@ class PortForwarder:
         except Exception as e:
             logger.error(f"TCP client handle error: {e}")
         finally:
-            self.stats['active_connections'] -= 1
+            if connection_counted:
+                self.stats['active_connections'] = max(0, self.stats['active_connections'] - 1)
             writer.close()
             await writer.wait_closed()
     
@@ -605,37 +633,44 @@ class PortForwarder:
     def udp_forward(self, local_port: int, remote_host: str, remote_port: int, forward_id: str):
         """UDP端口转发"""
         def udp_server():
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(('0.0.0.0', local_port))
-            
-            self.active_forwards[forward_id]['socket'] = sock
-            logger.info(f"UDP forwarding started: {local_port} -> {remote_host}:{remote_port}")
-            
-            clients = {}
-            
             try:
-                while self.running and forward_id in self.active_forwards:
-                    try:
-                        sock.settimeout(1.0)
-                        data, addr = sock.recvfrom(8192)
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind(('0.0.0.0', local_port))
+                
+                self.active_forwards[forward_id]['socket'] = sock
+                logger.info(f"UDP forwarding started: {local_port} -> {remote_host}:{remote_port}")
+                
+                clients = {}
+                
+                try:
+                    while self.running and forward_id in self.active_forwards:
+                        try:
+                            sock.settimeout(1.0)
+                            data, addr = sock.recvfrom(8192)
+                            
+                            if addr not in clients:
+                                clients[addr] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                            
+                            clients[addr].sendto(data, (remote_host, remote_port))
+                            self.stats['bytes_transferred'] += len(data)
+                            
+                        except socket.timeout:
+                            continue
+                        except Exception as e:
+                            logger.error(f"UDP forward error: {e}")
+                            break
+                            
+                finally:
+                    sock.close()
+                    for client_sock in clients.values():
+                        client_sock.close()
                         
-                        if addr not in clients:
-                            clients[addr] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                        
-                        clients[addr].sendto(data, (remote_host, remote_port))
-                        self.stats['bytes_transferred'] += len(data)
-                        
-                    except socket.timeout:
-                        continue
-                    except Exception as e:
-                        logger.error(f"UDP forward error: {e}")
-                        break
-                        
-            finally:
-                sock.close()
-                for client_sock in clients.values():
-                    client_sock.close()
+            except Exception as e:
+                logger.error(f"UDP forward setup error: {e}")
+                if forward_id in self.active_forwards:
+                    self.active_forwards[forward_id]['status'] = 'error'
+                    self.active_forwards[forward_id]['error'] = str(e)
         
         thread = threading.Thread(target=udp_server, daemon=True)
         thread.start()
@@ -739,11 +774,18 @@ class PortForwarder:
     def get_stats(self) -> dict:
         """获取统计信息"""
         uptime = time.time() - self.stats['start_time']
-        return {
-            **self.stats,
+        
+        # 确保统计数据不为负数
+        safe_stats = {
+            'total_connections': max(0, self.stats['total_connections']),
+            'active_connections': max(0, self.stats['active_connections']),
+            'bytes_transferred': max(0, self.stats['bytes_transferred']),
+            'start_time': self.stats['start_time'],
             'uptime': uptime,
             'active_forwards': len(self.active_forwards)
         }
+        
+        return safe_stats
     
     def get_serializable_forwards(self) -> list:
         """获取可序列化的转发信息"""
